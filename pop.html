@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finger Pop</title>
+<style>
+  :root { --bg: #0b0a14; --fg: #ffffff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif; }
+  video { display: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #status { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); font-size: 15px;
+    background: rgba(0,0,0,.55); padding: 8px 14px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="status">loading…</div>
+
+<script type="module">
+const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const ROUND_MS = 60000;
+const FONT = 'ui-rounded, "SF Pro Rounded", system-ui, sans-serif';
+const POP_WORDS = ["POP!", "boop", "yoink", "splat", "pew", "bonk", "yeet", "nice", "wheee", "blip", "plop", "zoink"];
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("v");
+const statusEl = document.getElementById("status");
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const d2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+
+// ---------- canvas sizing ----------
+let W = 0, H = 0;
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize); resize();
+const S = () => clamp(Math.min(W, H) / 800, 0.6, 1.5); // size scale
+
+function setStatus(t) { statusEl.textContent = t; statusEl.style.display = t ? "block" : "none"; }
+
+// ---------- sound (synthesized, no files) ----------
+let actx = null;
+function audio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (actx && actx.state === "suspended") actx.resume().catch(() => {});
+}
+addEventListener("pointerdown", audio); addEventListener("keydown", audio);
+function beep({ f0 = 600, f1 = 1200, dur = 0.09, type = "sine", vol = 0.22, delay = 0 } = {}) {
+  if (!actx || actx.state !== "running") return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+
+// ---------- camera + hand tracker ----------
+let landmarker = null, camOK = false, lastVideoTime = -1;
+let hands = []; // each: 21 landmarks in screen coords
+
+async function initCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+    video.srcObject = stream; await video.play(); camOK = true; return true;
+  } catch (e) { console.warn("camera:", e); return false; }
+}
+async function initModel() {
+  const { HandLandmarker, FilesetResolver } = await import(`${CDN}/vision_bundle.mjs`);
+  const fileset = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
+  const opts = delegate => ({ baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2 });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { console.warn("GPU failed, using CPU", e); landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+(async () => {
+  setStatus("📷 asking for your camera…");
+  if (!(await initCamera())) { setStatus("No camera access — you can still play with the mouse"); return; }
+  setStatus("🧠 loading the hand tracker…");
+  try { await initModel(); setStatus("✋ show me your index finger!"); setTimeout(() => setStatus(""), 3000); }
+  catch (e) { console.error(e); setStatus("Hand tracker failed to load — mouse mode"); }
+})();
+
+function videoRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const s = Math.max(W / vw, H / vh), w = vw * s, h = vh * s;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
+function detect(now) {
+  if (!landmarker || !camOK || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
+  const r = videoRect(); if (!r) return;
+  // mirror x so it feels like a mirror
+  hands = (res.landmarks || []).map(lm => lm.map(p => ({ x: r.x + (1 - p.x) * r.w, y: r.y + p.y * r.h })));
+}
+
+// ---------- pointers (two fingertips + mouse) ----------
+const mkPtr = () => ({ x: 0, y: 0, px: 0, py: 0, active: false, seen: -1e9, trail: [] });
+const fingers = [mkPtr(), mkPtr()];
+const mouse = { ...mkPtr(), tx: 0, ty: 0 };
+addEventListener("pointermove", e => { mouse.tx = e.clientX; mouse.ty = e.clientY; mouse.seen = performance.now(); });
+let clicks = [];
+addEventListener("pointerdown", e => clicks.push({ x: e.clientX, y: e.clientY }));
+
+function updatePointers(now) {
+  // match detected fingertips to the two slots by nearest distance so they don't swap
+  const tips = hands.map(h => h[8]);
+  let assign = [null, null];
+  if (tips.length === 1) {
+    const t = tips[0];
+    let slot = 0;
+    if (fingers[0].active && fingers[1].active) slot = d2(fingers[0], t) <= d2(fingers[1], t) ? 0 : 1;
+    else if (fingers[1].active) slot = 1;
+    assign[slot] = t;
+  } else if (tips.length >= 2) {
+    const [a, b] = tips, f0 = fingers[0], f1 = fingers[1];
+    const keep = (f0.active ? d2(f0, a) : 0) + (f1.active ? d2(f1, b) : 0);
+    const swap = (f0.active ? d2(f0, b) : 0) + (f1.active ? d2(f1, a) : 0);
+    assign = keep <= swap ? [a, b] : [b, a];
+  }
+  fingers.forEach((f, i) => {
+    const t = assign[i];
+    f.px = f.x; f.py = f.y;
+    if (t) {
+      const jump = f.active ? Math.sqrt(d2(f, t)) : Infinity;
+      if (jump > 300 * S()) { f.x = f.px = t.x; f.y = f.py = t.y; f.trail.length = 0; } // teleport, no sweep
+      else { f.x += (t.x - f.x) * 0.65; f.y += (t.y - f.y) * 0.65; }
+      f.active = true; f.seen = now;
+    } else if (now - f.seen > 150) { f.active = false; f.trail.length = 0; }
+  });
+  const wasActive = mouse.active;
+  mouse.active = now - mouse.seen < 2000;
+  mouse.px = wasActive ? mouse.x : mouse.tx; mouse.py = wasActive ? mouse.y : mouse.ty;
+  mouse.x = mouse.tx; mouse.y = mouse.ty;
+  if (!mouse.active) mouse.trail.length = 0;
+
+  for (const p of [...fingers, mouse]) {
+    if (p.active) p.trail.push({ x: p.x, y: p.y, t: now });
+    while (p.trail.length && now - p.trail[0].t > 160) p.trail.shift();
+  }
+}
+const activePointers = () => [...fingers.filter(f => f.active), ...(mouse.active ? [mouse] : [])];
+
+// ---------- game state ----------
+let state = "menu", score = 0, lives = 3, combo = 0, lastPop = 0;
+let roundStart = 0, roundEnd = 0, spawnAcc = 0, shake = 0, overAt = 0, newBest = false;
+let bubbles = [], parts = [], texts = [];
+let best = 0;
+try { best = +localStorage.getItem("fingerpop-best") || 0; } catch (e) {}
+
+const button = { x: 0, y: 0, r: 0, hold: 0, label: "START" };
+
+function startRound(now) {
+  audio();
+  state = "playing"; score = 0; lives = 3; combo = 0;
+  bubbles = []; roundStart = now; roundEnd = now + ROUND_MS; spawnAcc = 0;
+  [0, 0.08, 0.16].forEach((d, i) => beep({ f0: 500 + i * 200, f1: 700 + i * 200, dur: 0.1, delay: d, type: "triangle" }));
+}
+function endRound(now) {
+  state = "over"; overAt = now; button.hold = 0;
+  newBest = score > best;
+  if (newBest) { best = score; try { localStorage.setItem("fingerpop-best", best); } catch (e) {} }
+  [0, 0.12, 0.24].forEach((d, i) => beep({ f0: 700 - i * 150, f1: 500 - i * 150, dur: 0.16, delay: d, type: "triangle" }));
+}
+
+function spawn(now, ambient) {
+  const elapsed = (now - roundStart) / 1000;
+  const bombChance = ambient ? 0 : Math.min(0.08 + elapsed * 0.003, 0.22);
+  const roll = Math.random();
+  const type = roll < bombChance ? "bomb" : roll < bombChance + 0.05 && !ambient ? "gold" : "normal";
+  const r = (type === "normal" ? rand(24, 62) : type === "gold" ? 30 : 36) * S();
+  const speed = (ambient ? rand(40, 80) : rand(70, 140) * (1 + elapsed / 50)) * S();
+  const x0 = rand(r, W - r);
+  bubbles.push({ x: x0, x0, y: H + r, r, vy: speed, phase: rand(0, 6.28), wob: rand(10, 35) * S(), hue: rand(0, 360), type, t: 0 });
+}
+
+function burst(x, y, hue, n, sat = 90) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), sp = rand(80, 380) * S();
+    parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, decay: rand(1.4, 2.6), size: rand(2, 6) * S(), hue, sat });
+  }
+}
+function say(x, y, text, color, size = 28) { texts.push({ x, y, text, color, size: size * S(), life: 1 }); }
+
+function pop(b, now) {
+  const scoring = state === "playing";
+  if (b.type === "bomb") {
+    shake = 0.45; burst(b.x, b.y, 0, 40, 100); say(b.x, b.y, "OUCH", "#ff6b6b", 40);
+    beep({ f0: 220, f1: 40, dur: 0.4, type: "sawtooth", vol: 0.3 });
+    combo = 0; lives--;
+    if (lives <= 0) endRound(now);
+    return;
+  }
+  combo = now - lastPop < 900 ? combo + 1 : 1; lastPop = now;
+  const base = b.type === "gold" ? 10 : b.r < 34 * S() ? 3 : b.r < 48 * S() ? 2 : 1;
+  const pts = base * Math.min(combo, 5);
+  burst(b.x, b.y, b.type === "gold" ? 48 : b.hue, b.type === "gold" ? 34 : 18);
+  beep({ f0: 450 + Math.random() * 250 + Math.min(combo, 8) * 70, f1: 1500, dur: 0.08 });
+  if (scoring) {
+    score += pts;
+    say(b.x, b.y, `${pick(POP_WORDS)} +${pts}`, b.type === "gold" ? "#ffd84d" : "#ffffff");
+    if (b.type === "gold") { roundEnd += 3000; say(b.x, b.y + 34 * S(), "+3 sec!", "#ffd84d", 24); }
+  } else {
+    say(b.x, b.y, pick(POP_WORDS), "#ffffff", 22);
+  }
+}
+
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+  const t = L ? clamp(((px - ax) * dx + (py - ay) * dy) / L, 0, 1) : 0;
+  return Math.hypot(ax + t * dx - px, ay + t * dy - py);
+}
+
+function updateButton(dt, now, ptrs) {
+  button.x = W / 2; button.y = H * 0.66; button.r = 70 * S();
+  button.label = state === "menu" ? "START" : "AGAIN";
+  const ready = state === "menu" || now - overAt > 1200; // don't instantly restart
+  const over = ready && ptrs.some(p => Math.hypot(p.x - button.x, p.y - button.y) < button.r);
+  button.hold = over ? button.hold + dt : Math.max(0, button.hold - dt * 2);
+  const clicked = ready && clicks.some(c => Math.hypot(c.x - button.x, c.y - button.y) < button.r);
+  if (button.hold >= 1 || clicked) { button.hold = 0; startRound(now); }
+}
+
+function update(dt, now) {
+  const ptrs = activePointers();
+  if (state === "playing") {
+    if (now >= roundEnd) endRound(now);
+    const interval = 0.75 - 0.47 * clamp((now - roundStart) / ROUND_MS, 0, 1);
+    spawnAcc += dt;
+    while (spawnAcc > interval) { spawnAcc -= interval; spawn(now, false); }
+  } else {
+    updateButton(dt, now, ptrs);
+    spawnAcc += dt;
+    if (spawnAcc > 1.1) { spawnAcc = 0; spawn(now, true); }
+  }
+  clicks = [];
+
+  const fr = 16 * S();
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.t += dt; b.y -= b.vy * dt; b.x = b.x0 + Math.sin(b.t * 1.6 + b.phase) * b.wob;
+    if (b.y < -b.r - 20) { bubbles.splice(i, 1); continue; }
+    if (ptrs.some(p => segDist(b.x, b.y, p.px, p.py, p.x, p.y) < b.r + fr)) {
+      bubbles.splice(i, 1); pop(b, now);
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.vy += 420 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98;
+    p.life -= p.decay * dt; if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (let i = texts.length - 1; i >= 0; i--) {
+    const t = texts[i]; t.y -= 50 * dt; t.life -= 1.1 * dt; if (t.life <= 0) texts.splice(i, 1);
+  }
+  shake = Math.max(0, shake - dt);
+}
+
+// ---------- drawing ----------
+function drawBackground(now) {
+  const r = camOK ? videoRect() : null;
+  if (r && video.readyState >= 2) {
+    ctx.save(); ctx.translate(r.x + r.w, r.y); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, r.w, r.h); ctx.restore();
+    ctx.fillStyle = "rgba(10,6,28,0.38)"; ctx.fillRect(0, 0, W, H);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, "#1b1140"); g.addColorStop(1, "#0b2a3a");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawBubble(b, now) {
+  if (b.type === "bomb") {
+    const pulse = 0.5 + 0.5 * Math.sin(now / 120);
+    ctx.fillStyle = `rgba(255,40,60,${0.18 + 0.2 * pulse})`;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r * 1.25, 0, Math.PI * 2); ctx.fill();
+    ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(Math.sin(now / 150 + b.phase) * 0.25);
+    ctx.font = `${b.r * 1.7}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("💣", 0, 0); ctx.restore();
+    return;
+  }
+  const hue = b.type === "gold" ? 48 : b.hue;
+  const g = ctx.createRadialGradient(b.x - b.r * 0.35, b.y - b.r * 0.35, b.r * 0.1, b.x, b.y, b.r);
+  g.addColorStop(0, `hsla(${hue},100%,96%,0.85)`);
+  g.addColorStop(0.55, `hsla(${hue},90%,65%,0.28)`);
+  g.addColorStop(1, `hsla(${hue},95%,60%,0.75)`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = `hsla(${hue},100%,85%,0.85)`; ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  ctx.beginPath(); ctx.ellipse(b.x - b.r * 0.4, b.y - b.r * 0.45, b.r * 0.2, b.r * 0.1, -0.6, 0, Math.PI * 2); ctx.fill();
+  if (b.type === "gold") {
+    ctx.font = `${b.r}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("⭐", b.x, b.y + b.r * 0.05);
+  }
+}
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+function drawHands() {
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,255,255,0.28)"; ctx.lineCap = "round";
+  for (const h of hands) {
+    ctx.beginPath();
+    for (const [a, b] of BONES) { ctx.moveTo(h[a].x, h[a].y); ctx.lineTo(h[b].x, h[b].y); }
+    ctx.stroke();
+  }
+}
+function drawPointer(p, color) {
+  const tr = p.trail;
+  for (let i = 1; i < tr.length; i++) {
+    const k = i / tr.length;
+    ctx.strokeStyle = color; ctx.globalAlpha = k * 0.8; ctx.lineWidth = 14 * S() * k;
+    ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.shadowColor = color; ctx.shadowBlur = 24;
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(p.x, p.y, 12 * S(), 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(p.x, p.y, 5 * S(), 0, Math.PI * 2); ctx.fill();
+}
+
+function text(str, x, y, size, color = "#fff", align = "center", weight = 800) {
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.textAlign = align; ctx.textBaseline = "middle";
+  ctx.lineWidth = Math.max(3, size / 8); ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineJoin = "round";
+  ctx.strokeText(str, x, y); ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function drawButton(now) {
+  const ready = state === "menu" || now - overAt > 1200;
+  const { x, y, r } = button;
+  ctx.globalAlpha = ready ? 1 : 0.4;
+  ctx.fillStyle = "rgba(255,95,162,0.9)";
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  if (button.hold > 0) {
+    ctx.strokeStyle = "#ffd84d"; ctx.lineWidth = 10 * S(); ctx.lineCap = "round";
+    ctx.beginPath(); ctx.arc(x, y, r + 10 * S(), -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * button.hold); ctx.stroke();
+  }
+  text(button.label, x, y, 30 * S());
+  ctx.globalAlpha = 1;
+  text("hover your fingertip here (or click)", x, y + r + 34 * S(), 17 * S(), "rgba(255,255,255,0.85)", "center", 600);
+}
+
+function drawHUD(now) {
+  const s = S(), pad = 22 * s;
+  text(`${score}`, pad, pad + 18 * s, 40 * s, "#fff", "left");
+  if (combo >= 2 && now - lastPop < 900) text(`x${Math.min(combo, 5)} combo!`, pad, pad + 58 * s, 22 * s, "#ffd84d", "left");
+  const secs = Math.max(0, Math.ceil((roundEnd - now) / 1000));
+  text(`${secs}`, W / 2, pad + 18 * s, 40 * s, secs <= 10 ? "#ff6b6b" : "#fff");
+  ctx.font = `${30 * s}px serif`; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("❤️".repeat(lives) + "🖤".repeat(Math.max(0, 3 - lives)), W - pad, pad + 18 * s);
+}
+
+function draw(now) {
+  drawBackground(now);
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-1, 1) * shake * 30, rand(-1, 1) * shake * 30);
+  drawHands();
+  for (const b of bubbles) drawBubble(b, now);
+  for (const p of parts) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = `hsl(${p.hue},${p.sat}%,65%)`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const t of texts) { ctx.globalAlpha = clamp(t.life * 1.5, 0, 1); text(t.text, t.x, t.y, t.size, t.color); }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  const s = S();
+  if (state === "menu") {
+    const wob = Math.sin(now / 400) * 6 * s;
+    text("FINGER POP", W / 2, H * 0.26 + wob, 78 * s, "#ffd84d");
+    text("Poke bubbles with your index finger.", W / 2, H * 0.26 + 72 * s, 22 * s, "#fff", "center", 600);
+    text("Small = more points · ⭐ = +3 sec · don't touch the 💣", W / 2, H * 0.26 + 104 * s, 18 * s, "rgba(255,255,255,0.85)", "center", 600);
+    if (best) text(`best: ${best}`, W / 2, H * 0.26 + 140 * s, 18 * s, "rgba(255,255,255,0.7)", "center", 600);
+    drawButton(now);
+  } else if (state === "playing") {
+    drawHUD(now);
+  } else if (state === "over") {
+    text(lives <= 0 ? "KABOOM" : "TIME!", W / 2, H * 0.24, 72 * s, lives <= 0 ? "#ff6b6b" : "#ffd84d");
+    text(`${score} points`, W / 2, H * 0.24 + 70 * s, 40 * s);
+    text(newBest ? "🎉 new best! 🎉" : `best: ${best}`, W / 2, H * 0.24 + 112 * s, 22 * s, newBest ? "#ffd84d" : "rgba(255,255,255,0.8)", "center", 700);
+    drawButton(now);
+  }
+
+  for (const f of fingers) if (f.active) drawPointer(f, "#5ff2ff");
+  if (mouse.active) drawPointer(mouse, "#ff9f43");
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  detect(now);
+  updatePointers(now);
+  update(dt, now);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

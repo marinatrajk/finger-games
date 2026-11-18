@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slice Party</title>
+<style>
+  :root { --bg: #0b0a14; --fg: #ffffff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif; }
+  video { display: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #status { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); font-size: 15px;
+    background: rgba(0,0,0,.55); padding: 8px 14px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="status">loading…</div>
+
+<script type="module">
+const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const FONT = 'ui-rounded, "SF Pro Rounded", system-ui, sans-serif';
+const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",serif';
+const FRUITS = [
+  { e: "🍉", c: "#ff3b5c" }, { e: "🍊", c: "#ff9a1f" }, { e: "🍎", c: "#ff3b30" }, { e: "🍋", c: "#ffe14d" },
+  { e: "🍌", c: "#ffe680" }, { e: "🍍", c: "#ffd23f" }, { e: "🥝", c: "#8bd94a" }, { e: "🍑", c: "#ffa36c" },
+  { e: "🍇", c: "#a45cff" }, { e: "🥥", c: "#f4efe6" }, { e: "🍓", c: "#ff2d55" }, { e: "🍐", c: "#c7e86b" },
+  { e: "🥭", c: "#ffb020" },
+];
+const SLICE_WORDS = ["chop!", "slice!", "juicy", "swish", "yum", "splat", "nice", "ka-chop", "whoa"];
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("v");
+const statusEl = document.getElementById("status");
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const d2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+
+// ---------- canvas sizing ----------
+let W = 0, H = 0;
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize); resize();
+const S = () => clamp(Math.min(W, H) / 800, 0.6, 1.5); // size scale
+const G = () => 1.25 * H;                                // gravity, px/s²
+const BLADE_SPEED = () => 650 * S();                     // how fast a finger must move to cut
+
+function setStatus(t) { statusEl.textContent = t; statusEl.style.display = t ? "block" : "none"; }
+
+// ---------- emoji sprites (so fruit can be cut in half) ----------
+const sprites = new Map();
+function sprite(e) {
+  if (!sprites.has(e)) {
+    const c = document.createElement("canvas"); c.width = c.height = 160;
+    const g = c.getContext("2d");
+    g.font = `118px ${EMOJI_FONT}`; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText(e, 80, 86);
+    sprites.set(e, c);
+  }
+  return sprites.get(e);
+}
+
+// ---------- sound (synthesized, no files) ----------
+let actx = null, noiseBuf = null;
+function audio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (actx && actx.state === "suspended") actx.resume().catch(() => {});
+}
+addEventListener("pointerdown", audio); addEventListener("keydown", audio);
+const soundOn = () => actx && actx.state === "running";
+function beep({ f0 = 600, f1 = 1200, dur = 0.09, type = "sine", vol = 0.2, delay = 0 } = {}) {
+  if (!soundOn()) return;
+  const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+function swish({ dur = 0.14, f0 = 3000, f1 = 700, vol = 0.35, q = 1.2 } = {}) {
+  if (!soundOn()) return;
+  if (!noiseBuf) {
+    const len = actx.sampleRate * 0.8; noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const t = actx.currentTime, src = actx.createBufferSource(); src.buffer = noiseBuf;
+  const bp = actx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = q;
+  bp.frequency.setValueAtTime(f0, t); bp.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const g = actx.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(bp).connect(g).connect(actx.destination); src.start(t); src.stop(t + dur + 0.02);
+}
+
+// ---------- camera + hand tracker ----------
+let landmarker = null, camOK = false, lastVideoTime = -1;
+let hands = []; // each: 21 landmarks in screen coords
+
+async function initCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+    video.srcObject = stream; await video.play(); camOK = true; return true;
+  } catch (e) { console.warn("camera:", e); return false; }
+}
+async function initModel() {
+  const { HandLandmarker, FilesetResolver } = await import(`${CDN}/vision_bundle.mjs`);
+  const fileset = await FilesetResolver.forVisionTasks(`${CDN}/wasm`);
+  const opts = delegate => ({ baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2 });
+  try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { console.warn("GPU failed, using CPU", e); landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+(async () => {
+  setStatus("📷 asking for your camera…");
+  if (!(await initCamera())) { setStatus("No camera access — swipe with the mouse instead"); return; }
+  setStatus("🧠 loading the hand tracker…");
+  try {
+    await initModel();
+    setStatus(soundOn() ? "✋ show me your index finger!" : "✋ show me your index finger · click once to turn on sound 🔊");
+    setTimeout(() => setStatus(""), 6000);
+  } catch (e) { console.error(e); setStatus("Hand tracker failed to load — mouse mode"); }
+})();
+
+function videoRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const s = Math.max(W / vw, H / vh), w = vw * s, h = vh * s;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
+function detect(now) {
+  if (!landmarker || !camOK || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res; try { res = landmarker.detectForVideo(video, now); } catch (e) { return; }
+  const r = videoRect(); if (!r) return;
+  // mirror x so it feels like a mirror
+  hands = (res.landmarks || []).map(lm => lm.map(p => ({ x: r.x + (1 - p.x) * r.w, y: r.y + p.y * r.h })));
+}
+
+// ---------- pointers (two fingertips + mouse) ----------
+const mkPtr = () => ({ x: 0, y: 0, px: 0, py: 0, spd: 0, active: false, seen: -1e9, trail: [], streak: 0, lastSlice: 0, sx: 0, sy: 0 });
+const fingers = [mkPtr(), mkPtr()];
+const mouse = { ...mkPtr(), tx: 0, ty: 0 };
+addEventListener("pointermove", e => { mouse.tx = e.clientX; mouse.ty = e.clientY; mouse.seen = performance.now(); });
+let clicks = [];
+addEventListener("pointerdown", e => clicks.push({ x: e.clientX, y: e.clientY }));
+
+function updatePointers(dt, now) {
+  // match detected fingertips to the two slots by nearest distance so they don't swap
+  const tips = hands.map(h => h[8]);
+  let assign = [null, null];
+  if (tips.length === 1) {
+    const t = tips[0];
+    let slot = 0;
+    if (fingers[0].active && fingers[1].active) slot = d2(fingers[0], t) <= d2(fingers[1], t) ? 0 : 1;
+    else if (fingers[1].active) slot = 1;
+    assign[slot] = t;
+  } else if (tips.length >= 2) {
+    const [a, b] = tips, f0 = fingers[0], f1 = fingers[1];
+    const keep = (f0.active ? d2(f0, a) : 0) + (f1.active ? d2(f1, b) : 0);
+    const swap = (f0.active ? d2(f0, b) : 0) + (f1.active ? d2(f1, a) : 0);
+    assign = keep <= swap ? [a, b] : [b, a];
+  }
+  fingers.forEach((f, i) => {
+    const t = assign[i];
+    f.px = f.x; f.py = f.y;
+    if (t) {
+      if (!f.active) { f.x = f.px = t.x; f.y = f.py = t.y; f.trail.length = 0; f.spd = 0; } // just appeared: no sweep
+      else { f.x += (t.x - f.x) * 0.8; f.y += (t.y - f.y) * 0.8; }
+      f.active = true; f.seen = now;
+    } else if (now - f.seen > 150) { f.active = false; f.trail.length = 0; f.spd = 0; }
+  });
+  const wasActive = mouse.active;
+  mouse.active = now - mouse.seen < 2000;
+  mouse.px = wasActive ? mouse.x : mouse.tx; mouse.py = wasActive ? mouse.y : mouse.ty;
+  mouse.x = mouse.tx; mouse.y = mouse.ty;
+  if (!mouse.active) { mouse.trail.length = 0; mouse.spd = 0; }
+
+  for (const p of [...fingers, mouse]) {
+    if (!p.active) continue;
+    const v = Math.hypot(p.x - p.px, p.y - p.py) / Math.max(dt, 1 / 240);
+    p.spd = p.spd * 0.4 + v * 0.6;
+    p.trail.push({ x: p.x, y: p.y, t: now, fast: p.spd > BLADE_SPEED() * 0.6 });
+    while (p.trail.length && now - p.trail[0].t > 140) p.trail.shift();
+  }
+}
+const activePointers = () => [...fingers.filter(f => f.active), ...(mouse.active ? [mouse] : [])];
+
+// ---------- game state ----------
+let state = "menu", score = 0, lives = 3, best = 0, newBest = false;
+let roundStart = 0, nextWave = 0, overAt = 0, frenzyUntil = 0, nextFrenzyFruit = 0;
+let shake = 0, flash = 0;
+let items = [], queue = [], halves = [], parts = [], splats = [], texts = [], drops = [];
+let starter = { ...pick(FRUITS), r: 0, x: 0, y: 0, rot: 0 };
+try { best = +localStorage.getItem("slice-party-best") || 0; } catch (e) {}
+
+function startRound(now) {
+  audio();
+  state = "playing"; score = 0; lives = 3; frenzyUntil = 0;
+  items = []; queue = []; roundStart = now; nextWave = now + 700;
+}
+function endRound(now) {
+  if (state !== "playing") return;
+  state = "over"; overAt = now; queue = [];
+  starter = { ...pick(FRUITS), r: 0, x: 0, y: 0, rot: 0 };
+  newBest = score > best;
+  if (newBest) { best = score; try { localStorage.setItem("slice-party-best", best); } catch (e) {} }
+  [0, 0.14, 0.28].forEach((d, i) => beep({ f0: 520 - i * 120, f1: 380 - i * 120, dur: 0.18, delay: d, type: "triangle" }));
+}
+
+function launch(kind, now, frenzy = false) {
+  const g = G(), r = (kind === "bomb" ? 40 : 46) * S();
+  const x = rand(0.12 * W, 0.88 * W);
+  const vy = -Math.sqrt(2 * g * rand(0.55, 0.88) * H);
+  const tPeak = -vy / g;
+  const vx = (rand(0.3 * W, 0.7 * W) - x) / (tPeak * 1.6);
+  const look = kind === "fruit" ? pick(FRUITS) : kind === "chili" ? { e: "🌶️", c: "#ff3b1f" } : { e: "💣", c: "#ff8a00" };
+  items.push({ kind, ...look, x, y: H + r, vx, vy, rot: rand(0, 6.28), vr: rand(-3, 3), r, frenzy });
+  beep({ f0: 140, f1: 260, dur: 0.07, vol: 0.06 });
+}
+
+function scheduleWave(now) {
+  const t = (now - roundStart) / 1000;
+  const n = 1 + Math.floor(Math.random() * (1 + Math.min(4, Math.floor(t / 12))));
+  const bombP = Math.min(0.12 + t * 0.004, 0.45), maxBombs = t > 40 ? 2 : 1;
+  let bombs = 0;
+  for (let i = 0; i < n; i++) {
+    let kind = "fruit";
+    if ((i > 0 || n === 1) && bombs < maxBombs && Math.random() < bombP) { kind = "bomb"; bombs++; }
+    queue.push({ at: now + i * rand(90, 260), kind });
+  }
+  if (t > 8 && now > frenzyUntil && Math.random() < 0.07) queue.push({ at: now + rand(100, 400), kind: "chili" });
+  nextWave = now + Math.max(0.9, 2.3 - t * 0.022) * 1000;
+}
+
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+  const t = L ? clamp(((px - ax) * dx + (py - ay) * dy) / L, 0, 1) : 0;
+  return Math.hypot(ax + t * dx - px, ay + t * dy - py);
+}
+
+function say(x, y, text, color, size = 28) { texts.push({ x, y, text, color, size: size * S(), life: 1 }); }
+function spray(x, y, color, n, power = 1) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), sp = rand(60, 420) * S() * power;
+    parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120 * S(), life: 1, decay: rand(1.2, 2.4), size: rand(2, 7) * S(), color });
+  }
+}
+function cutInHalf(it, angle, push = 1) {
+  const nx = -Math.sin(angle), ny = Math.cos(angle), sp = 140 * S() * push;
+  for (const side of [1, -1]) {
+    halves.push({ e: it.e, x: it.x, y: it.y, r: it.r, rot: it.rot, cut: angle - it.rot, side,
+      vx: (it.vx || 0) + nx * sp * side + Math.cos(angle) * 60 * S(),
+      vy: (it.vy || 0) * 0.4 + ny * sp * side + Math.sin(angle) * 60 * S() - 120 * S(),
+      vr: (it.vr || 0) + side * rand(1.5, 4) });
+  }
+  splats.push({ x: it.x, y: it.y, c: it.c, life: 1, blobs: Array.from({ length: 7 }, () => ({
+    dx: rand(-1, 1) * it.r * 1.1, dy: rand(-1, 1) * it.r * 1.1, r: rand(0.25, 0.7) * it.r })) });
+  spray(it.x, it.y, it.c, 22);
+}
+
+function slice(it, p, now) {
+  const angle = Math.atan2(p.y - p.py, p.x - p.px);
+  if (it.kind === "bomb") {
+    flash = 1; shake = 0.6;
+    spray(it.x, it.y, "#ffb347", 40, 1.6); spray(it.x, it.y, "#777", 25, 1.2);
+    say(it.x, it.y, "KABOOM", "#ff6b6b", 46);
+    swish({ dur: 0.7, f0: 900, f1: 50, vol: 0.7, q: 0.6 }); beep({ f0: 120, f1: 30, dur: 0.5, type: "sawtooth", vol: 0.25 });
+    lives--; if (lives <= 0) endRound(now);
+    return;
+  }
+  cutInHalf(it, angle);
+  swish(); beep({ f0: 200, f1: 70, dur: 0.1, vol: 0.18 });
+  score += 1;
+  if (it.kind === "chili") {
+    frenzyUntil = now + 5000; nextFrenzyFruit = now;
+    nextWave = Math.max(nextWave, frenzyUntil + 600);
+    say(it.x, it.y, "SPICY FRENZY!", "#ff5a2a", 40);
+    [0, 0.07, 0.14, 0.21].forEach((d, i) => beep({ f0: 400 + i * 150, f1: 600 + i * 150, dur: 0.08, delay: d, type: "square", vol: 0.08 }));
+  } else {
+    say(it.x, it.y - it.r, pick(SLICE_WORDS), "#ffffff", 24);
+  }
+  p.streak = now - p.lastSlice < 250 ? p.streak + 1 : 1;
+  p.lastSlice = now; p.sx = it.x; p.sy = it.y;
+}
+
+function update(dt, now) {
+  const ptrs = activePointers();
+  const blades = ptrs.filter(p => p.spd > BLADE_SPEED());
+  const g = G();
+
+  if (state === "playing") {
+    if (now >= nextWave && now > frenzyUntil) scheduleWave(now);
+    if (now < frenzyUntil && now >= nextFrenzyFruit) { queue.push({ at: now, kind: "fruit", frenzy: true }); nextFrenzyFruit = now + 150; }
+    for (let i = queue.length - 1; i >= 0; i--) if (now >= queue[i].at) { launch(queue[i].kind, now, queue[i].frenzy); queue.splice(i, 1); }
+  } else {
+    // the fruit you slice to start
+    const ready = state === "menu" || now - overAt > 1200;
+    starter.r = 58 * S(); starter.x = W / 2; starter.y = H * 0.64 + Math.sin(now / 500) * 10 * S(); starter.rot = Math.sin(now / 700) * 0.3;
+    if (ready) {
+      const hit = blades.find(p => segDist(starter.x, starter.y, p.px, p.py, p.x, p.y) < starter.r);
+      const clicked = clicks.some(c => Math.hypot(c.x - starter.x, c.y - starter.y) < starter.r);
+      if (hit || clicked) {
+        audio();
+        const angle = hit ? Math.atan2(hit.y - hit.py, hit.x - hit.px) : rand(-0.6, 0.6);
+        cutInHalf(starter, angle, 1.4); swish(); beep({ f0: 200, f1: 70, dur: 0.1, vol: 0.18 });
+        startRound(now);
+      }
+    }
+  }
+  clicks = [];
+
+  // flying fruit + bombs
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.vy += g * dt; it.x += it.vx * dt; it.y += it.vy * dt; it.rot += it.vr * dt;
+    if (it.kind === "bomb" && Math.random() < 0.5) {
+      const fx = it.x + Math.cos(it.rot - 0.8) * it.r * 0.7, fy = it.y + Math.sin(it.rot - 0.8) * it.r * 0.7;
+      parts.push({ x: fx, y: fy, vx: rand(-60, 60), vy: rand(-120, -20), life: 0.6, decay: 2.5, size: rand(1.5, 3.5) * S(), color: "#ffd84d" });
+    }
+    if (it.y > H + it.r * 2 && it.vy > 0) {
+      items.splice(i, 1);
+      if (state === "playing" && it.kind === "fruit" && !it.frenzy) {
+        lives--; drops.push({ x: clamp(it.x, 40, W - 40), life: 1 });
+        beep({ f0: 300, f1: 140, dur: 0.22, type: "square", vol: 0.07 });
+        if (lives <= 0) endRound(now);
+      }
+      continue;
+    }
+    if (state !== "playing") continue;
+    const p = blades.find(p => segDist(it.x, it.y, p.px, p.py, p.x, p.y) < it.r * 0.9);
+    if (p) { items.splice(i, 1); slice(it, p, now); }
+  }
+
+  // multi-fruit swipe bonus: a combo ends when the swipe slows down or there's a pause
+  for (const p of [...fingers, mouse]) {
+    if (p.streak && (now - p.lastSlice > 250 || p.spd < BLADE_SPEED() * 0.5)) {
+      if (p.streak >= 3 && state === "playing") {
+        score += p.streak;
+        say(p.sx, p.sy - 40 * S(), `${p.streak} fruit combo! +${p.streak}`, "#ffd84d", 32);
+        [0, 0.06, 0.12].forEach((d, i) => beep({ f0: 700 + i * 200, f1: 900 + i * 200, dur: 0.07, delay: d, type: "triangle", vol: 0.12 }));
+      }
+      p.streak = 0;
+    }
+  }
+
+  for (let i = halves.length - 1; i >= 0; i--) {
+    const h = halves[i];
+    h.vy += g * dt; h.x += h.vx * dt; h.y += h.vy * dt; h.rot += h.vr * dt;
+    if (h.y > H + h.r * 3) halves.splice(i, 1);
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.vy += g * 0.5 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98;
+    p.life -= p.decay * dt; if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (let i = splats.length - 1; i >= 0; i--) { splats[i].life -= dt * 0.35; if (splats[i].life <= 0) splats.splice(i, 1); }
+  for (let i = texts.length - 1; i >= 0; i--) { const t = texts[i]; t.y -= 50 * dt; t.life -= 1.1 * dt; if (t.life <= 0) texts.splice(i, 1); }
+  for (let i = drops.length - 1; i >= 0; i--) { drops[i].life -= dt * 0.8; if (drops[i].life <= 0) drops.splice(i, 1); }
+  shake = Math.max(0, shake - dt); flash = Math.max(0, flash - dt * 2.5);
+}
+
+// ---------- drawing ----------
+function drawBackground() {
+  const r = camOK ? videoRect() : null;
+  if (r && video.readyState >= 2) {
+    ctx.save(); ctx.translate(r.x + r.w, r.y); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, r.w, r.h); ctx.restore();
+    ctx.fillStyle = "rgba(10,6,28,0.4)"; ctx.fillRect(0, 0, W, H);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, "#1b1140"); g.addColorStop(1, "#0b2a3a");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawSprite(e, x, y, r, rot) {
+  const D = r * 2.3;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.drawImage(sprite(e), -D / 2, -D / 2, D, D); ctx.restore();
+}
+function drawHalf(h) {
+  const D = h.r * 2.3;
+  ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(h.rot);
+  ctx.rotate(h.cut); ctx.beginPath(); ctx.rect(-D, h.side > 0 ? 0 : -D, 2 * D, D); ctx.clip(); ctx.rotate(-h.cut);
+  ctx.drawImage(sprite(h.e), -D / 2, -D / 2, D, D);
+  ctx.restore();
+}
+function drawItem(it, now) {
+  if (it.kind === "bomb") {
+    const pulse = 0.5 + 0.5 * Math.sin(now / 110);
+    ctx.fillStyle = `rgba(255,40,60,${0.2 + 0.25 * pulse})`;
+    ctx.beginPath(); ctx.arc(it.x, it.y, it.r * 1.3, 0, Math.PI * 2); ctx.fill();
+  } else if (it.kind === "chili") {
+    ctx.fillStyle = "rgba(255,120,0,0.3)";
+    ctx.beginPath(); ctx.arc(it.x, it.y, it.r * 1.3, 0, Math.PI * 2); ctx.fill();
+  }
+  drawSprite(it.e, it.x, it.y, it.r, it.rot);
+}
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+function drawHands() {
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(255,255,255,0.22)"; ctx.lineCap = "round";
+  for (const h of hands) {
+    ctx.beginPath();
+    for (const [a, b] of BONES) { ctx.moveTo(h[a].x, h[a].y); ctx.lineTo(h[b].x, h[b].y); }
+    ctx.stroke();
+  }
+}
+function drawBlade(p, color) {
+  const tr = p.trail, s = S();
+  ctx.lineCap = "round";
+  for (let i = 1; i < tr.length; i++) {
+    if (!tr[i].fast) continue;
+    const k = i / tr.length;
+    ctx.globalAlpha = k;
+    ctx.shadowColor = color; ctx.shadowBlur = 20;
+    ctx.strokeStyle = color; ctx.lineWidth = 16 * s * k;
+    ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 6 * s * k;
+    ctx.beginPath(); ctx.moveTo(tr[i - 1].x, tr[i - 1].y); ctx.lineTo(tr[i].x, tr[i].y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // fingertip marker (so you can see where you are even when not slicing)
+  ctx.strokeStyle = color; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(p.x, p.y, 11 * s, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(p.x, p.y, 4 * s, 0, Math.PI * 2); ctx.fill();
+}
+
+function text(str, x, y, size, color = "#fff", align = "center", weight = 800) {
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.textAlign = align; ctx.textBaseline = "middle";
+  ctx.lineWidth = Math.max(3, size / 8); ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineJoin = "round";
+  ctx.strokeText(str, x, y); ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function drawHUD(now) {
+  const s = S(), pad = 22 * s;
+  text(`${score}`, pad, pad + 20 * s, 46 * s, "#fff", "left");
+  text(`best ${Math.max(best, score)}`, pad, pad + 60 * s, 16 * s, "rgba(255,255,255,0.75)", "left", 600);
+  ctx.font = `${30 * s}px ${EMOJI_FONT}`; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("❤️".repeat(Math.max(0, lives)) + "🖤".repeat(Math.max(0, 3 - lives)), W - pad, pad + 20 * s);
+  if (now < frenzyUntil) text(`🌶️ FRENZY ${Math.ceil((frenzyUntil - now) / 1000)}`, W / 2, pad + 20 * s, 32 * s, "#ff7a3a");
+}
+
+function draw(now) {
+  drawBackground();
+  if (now < frenzyUntil) {
+    const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+    v.addColorStop(0, "rgba(255,60,0,0)"); v.addColorStop(1, `rgba(255,60,0,${0.25 + 0.1 * Math.sin(now / 120)})`);
+    ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  }
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-1, 1) * shake * 30, rand(-1, 1) * shake * 30);
+  for (const sp of splats) {
+    ctx.globalAlpha = sp.life * 0.5; ctx.fillStyle = sp.c;
+    for (const b of sp.blobs) { ctx.beginPath(); ctx.arc(sp.x + b.dx, sp.y + b.dy, b.r, 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+  drawHands();
+  for (const h of halves) drawHalf(h);
+  for (const it of items) drawItem(it, now);
+  for (const p of parts) {
+    ctx.globalAlpha = clamp(p.life, 0, 1); ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const t of texts) { ctx.globalAlpha = clamp(t.life * 1.5, 0, 1); text(t.text, t.x, t.y, t.size, t.color); }
+  for (const d of drops) { ctx.globalAlpha = d.life; text("✗", d.x, H - 40 * S(), 48 * S(), "#ff4d4d"); }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  const s = S();
+  if (state === "playing") {
+    drawHUD(now);
+  } else {
+    const ready = state === "menu" || now - overAt > 1200;
+    if (state === "menu") {
+      text("SLICE PARTY", W / 2, H * 0.22 + Math.sin(now / 400) * 6 * s, 80 * s, "#ffd84d");
+      text("Swipe your index finger fast to slice the fruit.", W / 2, H * 0.22 + 74 * s, 22 * s, "#fff", "center", 600);
+      text("Don't let fruit fall · don't slice the 💣 · 🌶️ = frenzy", W / 2, H * 0.22 + 106 * s, 18 * s, "rgba(255,255,255,0.85)", "center", 600);
+      if (best) text(`best: ${best}`, W / 2, H * 0.22 + 140 * s, 18 * s, "rgba(255,255,255,0.7)", "center", 600);
+    } else {
+      text("GAME OVER", W / 2, H * 0.22, 72 * s, "#ff6b6b");
+      text(`${score} sliced`, W / 2, H * 0.22 + 70 * s, 40 * s);
+      text(newBest ? "🎉 new best! 🎉" : `best: ${best}`, W / 2, H * 0.22 + 112 * s, 22 * s, newBest ? "#ffd84d" : "rgba(255,255,255,0.8)", "center", 700);
+    }
+    ctx.globalAlpha = ready ? 1 : 0.35;
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath(); ctx.arc(starter.x, starter.y, starter.r * 1.35, 0, Math.PI * 2); ctx.fill();
+    drawSprite(starter.e, starter.x, starter.y, starter.r, starter.rot);
+    ctx.globalAlpha = 1;
+    text(state === "menu" ? "slice it to start" : "slice it to play again", W / 2, starter.y + starter.r * 1.35 + 30 * s, 18 * s, "rgba(255,255,255,0.85)", "center", 600);
+  }
+
+  for (const f of fingers) if (f.active) drawBlade(f, "#5ff2ff");
+  if (mouse.active) drawBlade(mouse, "#ff9f43");
+
+  if (flash > 0) { ctx.fillStyle = `rgba(255,245,230,${flash * 0.8})`; ctx.fillRect(0, 0, W, H); }
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  detect(now);
+  updatePointers(dt, now);
+  update(dt, now);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// tiny hook for automated testing
+window.__game = () => ({ state, score, lives, items: items.map(i => ({ kind: i.kind, x: i.x, y: i.y, vx: i.vx, vy: i.vy })), halves: halves.length });
+</script>
+</body>
+</html>
