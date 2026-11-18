@@ -4,15 +4,17 @@ Silly browser games you play with your index finger, using your laptop camera.
 Hand and face tracking run in the browser with [MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker).
 There is no build step, no server-side code, and nothing leaves your machine.
 
-| Page | What it is |
+## Play it
+
+| Game | What it is |
 | --- | --- |
-| `index.html` | **Slice Party**: swipe your finger to slice flying fruit. Avoid the 💣, grab the 🌶️ for a frenzy. |
-| `pop.html` | **Finger Pop**: poke the bubbles before they float away. ⭐ adds time, 💣 costs a heart. |
-| `gta.html` | **Quick Question**: "Have you played GTA6?" The Yes button runs away from your finger, and an emoji takes over your face every time you miss. |
+| [**Slice Party**](https://marinatrajk.github.io/finger-games/) | Swipe your finger to slice flying fruit. Avoid the 💣, grab the 🌶️ for a frenzy. |
+| [**Finger Pop**](https://marinatrajk.github.io/finger-games/pop.html) | Poke the bubbles before they float away. ⭐ adds time, 💣 costs a heart. |
+| [**Quick Question**](https://marinatrajk.github.io/finger-games/gta.html) | "Have you played GTA6?" The Yes button runs away from your finger, and an emoji takes over your face every time you miss. |
 
-Every game also works with a mouse or trackpad if you don't want to use the camera.
+Open a link and allow the camera. Every game also works with a mouse or trackpad if you don't want to use the camera.
 
-## Run it
+## Run it locally
 
 Browsers only allow camera access on `localhost` or `https`, so serve the folder instead of opening the files directly:
 
